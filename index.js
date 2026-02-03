@@ -1,108 +1,246 @@
-/**
- * Cloudflare Worker: Wildcard subdomain proxy to a fixed US-West origin.
- *
- * Use case:
- * - Route: *.gitflare.net/*
- * - All global traffic goes to a fixed backend in US West (single origin).
- *
- * Notes:
- * - This controls Cloudflare -> Origin routing (回源)，不能控制用户进入哪个CF边缘节点。
- * - Keep your backend protected (e.g. only allow CF IPs, or require a secret header).
- */
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
 
-export default {
-  async fetch(request, env, ctx) {
-    // 1) Set your fixed US-West origin base URL here
-    // Example: "https://us-west-2-entrance.gitflare.net"
-    // Must include scheme (https://)
-    const BACKEND_BASE = env.BACKEND_BASE || "https://us-west.example.com";
+async function handleRequest(request) {
+  try {
+      const url = new URL(request.url);
 
-    // Optional: hard timeout (ms) for origin fetch
-    const ORIGIN_TIMEOUT_MS = Number(env.ORIGIN_TIMEOUT_MS || 8000);
+      // 如果访问根目录，返回HTML
+      if (url.pathname === "/") {
+          return new Response(getRootHtml(), {
+              headers: {
+                  'Content-Type': 'text/html; charset=utf-8'
+              }
+          });
+      }
 
-    const incomingUrl = new URL(request.url);
-    const backendBaseUrl = new URL(BACKEND_BASE);
+      // 从请求路径中提取目标 URL
+      let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
 
-    // 2) Build the backend URL: keep path + query exactly
-    const backendUrl = new URL(incomingUrl.pathname + incomingUrl.search, backendBaseUrl);
+      // 判断用户输入的 URL 是否带有协议
+      actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
 
-    // 3) Clone headers and add forwarding headers
-    // Important: "Host" is a forbidden header in many fetch environments; don't rely on setting it.
-    const headers = new Headers(request.headers);
+      // 保留查询参数
+      actualUrlStr += url.search;
 
-    // Remove hop-by-hop headers (safer for proxies)
-    // (Not exhaustive, but covers common ones)
-    headers.delete("connection");
-    headers.delete("keep-alive");
-    headers.delete("proxy-connection");
-    headers.delete("transfer-encoding");
-    headers.delete("upgrade");
+      // 创建新 Headers 对象，排除以 'cf-' 开头的请求头
+      const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
 
-    // Forward original host info to origin (so one origin can serve many subdomains)
-    headers.set("X-Forwarded-Host", incomingUrl.hostname);
-    headers.set("X-Forwarded-Proto", incomingUrl.protocol.replace(":", ""));
-    headers.set("X-Forwarded-Uri", incomingUrl.pathname + incomingUrl.search);
-
-    // CF provides these already, but keeping explicit is fine
-    // (If missing, it won't hurt)
-    const cfConnectingIp = request.headers.get("CF-Connecting-IP");
-    if (cfConnectingIp) headers.set("X-Real-IP", cfConnectingIp);
-
-    // Optional: add a secret header so your origin can reject direct public requests
-    // (RECOMMENDED for security; set env.ORIGIN_SECRET on Worker + check it on your origin)
-    if (env.ORIGIN_SECRET) {
-      headers.set("X-Worker-Proxy-Secret", env.ORIGIN_SECRET);
-    }
-
-    // 4) Prepare request init
-    // IMPORTANT: do not manually read/clone body; pass the original request to keep streaming.
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort("Origin timeout"), ORIGIN_TIMEOUT_MS);
-
-    let res;
-    try {
-      // Create a new Request to change only the URL, keeping method/body.
-      const proxyReq = new Request(backendUrl.toString(), {
-        method: request.method,
-        headers,
-        body: request.body,
-        redirect: "manual",
-        signal: controller.signal,
+      // 创建一个新的请求以访问目标 URL
+      const modifiedRequest = new Request(actualUrlStr, {
+          headers: newHeaders,
+          method: request.method,
+          body: request.body,
+          redirect: 'manual'
       });
 
-      // cf options (optional): you can tune caching behavior here if needed
-      res = await fetch(proxyReq, {
-        cf: {
-          // cacheEverything: false,
-          // cacheTtl: 0,
-        },
+      // 发起对目标 URL 的请求
+      const response = await fetch(modifiedRequest);
+      let body = response.body;
+
+      // 处理重定向
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+          body = response.body;
+          // 创建新的 Response 对象以修改 Location 头部
+          return handleRedirect(response, body);
+      } else if (response.headers.get("Content-Type")?.includes("text/html")) {
+          body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
+      }
+
+      // 创建修改后的响应对象
+      const modifiedResponse = new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers
       });
-    } catch (err) {
-      return new Response(
-        `Bad Gateway: failed to reach origin (US-West). ${String(err)}`,
-        { status: 502 }
-      );
-    } finally {
-      clearTimeout(timeoutId);
-    }
 
-    // 5) Return response to client (preserve status/headers/body)
-    // Remove hop-by-hop headers from response too
-    const outHeaders = new Headers(res.headers);
-    outHeaders.delete("connection");
-    outHeaders.delete("keep-alive");
-    outHeaders.delete("proxy-connection");
-    outHeaders.delete("transfer-encoding");
-    outHeaders.delete("upgrade");
+      // 添加禁用缓存的头部
+      setNoCacheHeaders(modifiedResponse.headers);
 
-    // Optional: expose where it was routed to (debug)
-    outHeaders.set("X-Proxy-Origin", backendBaseUrl.host);
-    outHeaders.set("X-Proxy-Worker", "wildcard-to-usw");
+      // 添加 CORS 头部，允许跨域访问
+      setCorsHeaders(modifiedResponse.headers);
 
-    return new Response(res.body, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: outHeaders,
-    });
-  },
-};
+      return modifiedResponse;
+  } catch (error) {
+      // 如果请求目标地址时出现错误，返回带有错误消息的响应和状态码 500（服务器错误）
+      return jsonResponse({
+          error: error.message
+      }, 500);
+  }
+}
+
+// 确保 URL 带有协议
+function ensureProtocol(url, defaultProtocol) {
+  return url.startsWith("http://") || url.startsWith("https://") ? url : defaultProtocol + "//" + url;
+}
+
+// 处理重定向
+function handleRedirect(response, body) {
+  const location = new URL(response.headers.get('location'));
+  const modifiedLocation = `/${encodeURIComponent(location.toString())}`;
+  return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: {
+          ...response.headers,
+          'Location': modifiedLocation
+      }
+  });
+}
+
+// 处理 HTML 内容中的相对路径
+async function handleHtmlContent(response, protocol, host, actualUrlStr) {
+  const originalText = await response.text();
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
+
+  return modifiedText;
+}
+
+// 替换 HTML 内容中的相对路径
+function replaceRelativePaths(text, protocol, host, origin) {
+  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
+  return text.replace(regex, `$1${protocol}//${host}/${origin}/`);
+}
+
+// 返回 JSON 格式的响应
+function jsonResponse(data, status) {
+  return new Response(JSON.stringify(data), {
+      status: status,
+      headers: {
+          'Content-Type': 'application/json; charset=utf-8'
+      }
+  });
+}
+
+// 过滤请求头
+function filterHeaders(headers, filterFunc) {
+  return new Headers([...headers].filter(([name]) => filterFunc(name)));
+}
+
+// 设置禁用缓存的头部
+function setNoCacheHeaders(headers) {
+  headers.set('Cache-Control', 'no-store');
+}
+
+// 设置 CORS 头部
+function setCorsHeaders(headers) {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+  headers.set('Access-Control-Allow-Headers', '*');
+}
+
+// 返回根目录的 HTML
+function getRootHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
+  <title>Proxy Everything</title>
+  <link rel="icon" type="image/png" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="Description" content="Proxy Everything with CF Workers.">
+  <meta property="og:description" content="Proxy Everything with CF Workers.">
+  <meta property="og:image" content="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="robots" content="index, follow">
+  <meta http-equiv="Content-Language" content="zh-CN">
+  <meta name="copyright" content="Copyright © ymyuuu">
+  <meta name="author" content="ymyuuu">
+  <link rel="apple-touch-icon-precomposed" sizes="120x120" href="https://s2.hdslb.com/bfs/openplatform/1682b11880f5c53171217a03c8adc9f2e2a27fcf.png@100w.webp">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+  <style>
+      body, html {
+          height: 100%;
+          margin: 0;
+      }
+      .background {
+          background-size: cover;
+          background-position: center;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+      }
+      .card {
+          background-color: rgba(255, 255, 255, 0.8);
+          transition: background-color 0.3s ease, box-shadow 0.3s ease;
+      }
+      .card:hover {
+          background-color: rgba(255, 255, 255, 1);
+          box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.3);
+      }
+      .input-field input[type=text] {
+          color: #2c3e50;
+      }
+      .input-field input[type=text]:focus+label {
+          color: #2c3e50 !important;
+      }
+      .input-field input[type=text]:focus {
+          border-bottom: 1px solid #2c3e50 !important;
+          box-shadow: 0 1px 0 0 #2c3e50 !important;
+      }
+      @media (prefers-color-scheme: dark) {
+          body, html {
+              background-color: #121212;
+              color: #e0e0e0;
+          }
+          .card {
+              background-color: rgba(33, 33, 33, 0.9);
+              color: #ffffff;
+          }
+          .card:hover {
+              background-color: rgba(50, 50, 50, 1);
+              box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.6);
+          }
+          .input-field input[type=text] {
+              color: #ffffff;
+          }
+          .input-field input[type=text]:focus+label {
+              color: #ffffff !important;
+          }
+          .input-field input[type=text]:focus {
+              border-bottom: 1px solid #ffffff !important;
+              box-shadow: 0 1px 0 0 #ffffff !important;
+          }
+          label {
+              color: #cccccc;
+          }
+      }
+  </style>
+</head>
+<body>
+  <div class="background">
+      <div class="container">
+          <div class="row">
+              <div class="col s12 m8 offset-m2 l6 offset-l3">
+                  <div class="card">
+                      <div class="card-content">
+                          <span class="card-title center-align"><i class="material-icons left">link</i>Proxy Everything</span>
+                          <form id="urlForm" onsubmit="redirectToProxy(event)">
+                              <div class="input-field">
+                                  <input type="text" id="targetUrl" placeholder="在此输入目标地址" required>
+                                  <label for="targetUrl">目标地址</label>
+                              </div>
+                              <button type="submit" class="btn waves-effect waves-light teal darken-2 full-width">跳转</button>
+                          </form>
+                      </div>
+                  </div>
+              </div>
+          </div>
+      </div>
+  </div>
+  <script src="https://s4.zstatic.net/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+  <script>
+      function redirectToProxy(event) {
+          event.preventDefault();
+          const targetUrl = document.getElementById('targetUrl').value.trim();
+          const currentOrigin = window.location.origin;
+          window.open(currentOrigin + '/' + encodeURIComponent(targetUrl), '_blank');
+      }
+  </script>
+</body>
+</html>`;
+}
